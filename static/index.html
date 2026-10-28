@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Classlab BEV 标注修订</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><header><strong>Classlab BEV 标注修订</strong><span id="clip"></span><span id="status"></span></header>
+<div class="toolbar">
+  <button id="prev" title="Shift+左方向键">◀ 上一帧</button><input id="frame" type="number" min="0" step="1" title="输入帧号，按回车或点击跳转"><button id="go">跳转</button><button id="next" title="Shift+右方向键">下一帧 ▶</button><button id="fit">适配全部目标</button><button id="near">前方 80 m</button>
+  <span id="stamp"></span><label>模式 <select id="mode"><option value="select">选择/拖动</option><option value="box">补画 3D 框</option><option value="divider">绘制车道线</option><option value="boundary">绘制道路边界</option><option value="ped_crossing">绘制人行横道</option><option value="point">给选中线加点</option></select></label>
+  <button id="finish">完成绘制</button><button id="remove">删除所选</button><button id="undo" title="Ctrl+Z">撤销</button><button id="redo" title="Ctrl+Y">重做</button><button id="redraw" title="Ctrl+Shift+Z；Esc 取消">重画所选线</button><button id="apply-rule">所选类别应用到同 ID 全片段</button><button id="apply-map-line">所选静态线映射到相邻帧</button><button id="save" class="primary" title="Ctrl+S">保存本帧</button><button id="export">导出 2 Hz 标签</button>
+</div>
+<main><section class="bev-panel"><div class="panel-title">BEV：前方朝上，左侧在左；滚轮缩放、右键拖动画布</div><canvas id="bev"></canvas><div class="legend"><span style="color:#ff6b6b">红色三角：自车（尖端朝前）</span><span>灰点：运动补偿点云</span><span class="divider">车道线 divider</span><span class="boundary">外推道路边界 boundary</span><span class="crossing">人行横道 ped_crossing</span><span class="box">3D 框</span></div></section>
+<section class="right-panel"><div class="panel-title">相机投影 <select id="camera"></select></div><div class="image-wrap"><canvas id="image"></canvas></div>
+<aside><h3>所选标注</h3><div id="inspector">点击 BEV 或相机图中的框、BEV 中的线。</div><p class="hint">相机图中的框与 BEV 中的框是同一个 3D 标注。手画的 divider、boundary、ped_crossing 可点“所选静态线映射到相邻帧”；Ctrl+S 保存本帧。双击或点“完成绘制”结束折线。</p></aside></section></main>
+<script src="/static/app.js"></script></body></html>
