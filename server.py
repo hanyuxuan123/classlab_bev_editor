@@ -19,7 +19,7 @@ from pathlib import Path
 import yaml
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 
-from geometry import (box_corners, frame_offsets, offset_outer_dividers,
+from geometry import (apply_boundary_policy, box_corners, frame_offsets,
                       pcd_bev_points, project, read_road_frame, rotate_quaternion)
 
 
@@ -65,16 +65,22 @@ def unique_box_ids(boxes):
 
 
 class Clip:
-    def __init__(self, root, edits_dir=None, boundary_offset_m=0.5):
+    def __init__(self, root, edits_dir=None, boundary_offset_m=0.5,
+                 boundary_policy='semantic', regenerate_auto_boundaries=False):
         if not math.isfinite(boundary_offset_m) or not 0 <= boundary_offset_m <= 3:
             raise ValueError('boundary offset must be between 0 and 3 m')
+        if boundary_policy not in ('semantic', 'outer-offset'):
+            raise ValueError('unknown boundary policy: {}'.format(boundary_policy))
         self.root = Path(root).resolve()
         self.result = self.root / 'result'
         self.edits = (Path(edits_dir).resolve() / self.root.name
                       if edits_dir is not None else self.root / 'reviews')
         self.edits.mkdir(parents=True, exist_ok=True)
         self.boundary_offset_m = boundary_offset_m
+        self.boundary_policy = boundary_policy
+        self.regenerate_auto_boundaries = regenerate_auto_boundaries
         self.rules_file = self.edits / 'class_rules.json'
+        self.deleted_tracks_file = self.edits / 'deleted_tracks.json'
         self.crossings_file = self.edits / 'crossings_global.json'
         self.boundaries_file = self.edits / 'boundaries_global.json'  # legacy
         self.map_lines_file = self.edits / 'map_lines_global.json'
@@ -185,14 +191,16 @@ class Clip:
             lines = read_road_frame(self.road_data, self.road_offsets[self.frame_index[frame]], frame)
             reviewed = False
             content = {}
+        deleted_tracks = self.deleted_tracks()
+        track_deleted = any(str(box.get('track_id')) in deleted_tracks
+                            for box in boxes)
+        boxes = [box for box in boxes
+                 if str(box.get('track_id')) not in deleted_tracks]
         unique_box_ids(boxes)
         lines = [line for line in lines if line.get('source') != 'road_edge.csv'
                  or line.get('class') != 'boundary_candidate']
-        if not content.get('auto_boundaries_reviewed'):
-            existing_ids = {line['id'] for line in lines}
-            lines.extend(edge for edge in offset_outer_dividers(
-                lines, frame, self.boundary_offset_m)
-                         if edge['id'] not in existing_ids)
+        generate_auto_boundaries = (self.regenerate_auto_boundaries
+                                    or not content.get('auto_boundaries_reviewed'))
         map_lines = self.map_lines()
         origin_ids = {item['origin_id'] for item in map_lines
                       if item.get('origin_frame') == frame and item.get('origin_id')}
@@ -247,10 +255,15 @@ class Clip:
                     and min(p[1] for p in points) <= 40 and max(p[1] for p in points) >= -40):
                 lines.append({'id': map_line['id'], 'class': map_line['class'],
                               'source': 'global-map-line', 'points': points})
+        # Apply semantic selection after both class rules and global manual
+        # map lines, so every explicit boundary takes priority over auto lines.
+        if generate_auto_boundaries:
+            lines = apply_boundary_policy(lines, frame, self.boundary_offset_m,
+                                          self.boundary_policy)
         image_stamps = {name: self._image(frame, name) for name in self.cameras}
         return {'frame': frame, 'timestamp': self.timestamps[frame], 'boxes': boxes,
                 'lines': lines, 'images': image_stamps,
-                'reviewed': reviewed or rule_applied or any(
+                'reviewed': reviewed or rule_applied or track_deleted or any(
                     line.get('source') in ('global-crossing', 'global-map-line')
                     for line in lines),
                 'local_reviewed': reviewed}
@@ -259,6 +272,54 @@ class Clip:
         if self.rules_file.exists():
             return json.loads(self.rules_file.read_text())
         return {'tracks': {}, 'lines': {}}
+
+    def deleted_tracks(self):
+        if not self.deleted_tracks_file.exists():
+            return set()
+        values = json.loads(self.deleted_tracks_file.read_text())
+        if not isinstance(values, list) or any(not isinstance(value, str)
+                                               for value in values):
+            raise ValueError('deleted_tracks.json must contain an array of strings')
+        return set(values)
+
+    def write_deleted_tracks(self, values):
+        temporary = self.deleted_tracks_file.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(sorted(values), ensure_ascii=False, indent=2))
+        os.replace(temporary, self.deleted_tracks_file)
+
+    def track_occurrences(self, track_id):
+        count = 0
+        frames = 0
+        for frame in self.frame_ids:
+            edit_file = self.edits / '{}.json'.format(frame)
+            if edit_file.exists():
+                boxes = json.loads(edit_file.read_text()).get('boxes', [])
+            else:
+                boxes = self._boxes(frame)
+            matches = sum(str(box.get('track_id')) == track_id for box in boxes)
+            count += matches
+            frames += bool(matches)
+        return count, frames
+
+    def delete_track(self, track_id):
+        if not isinstance(track_id, str) or not track_id or len(track_id) > 256:
+            abort(400, 'invalid track id')
+        count, frames = self.track_occurrences(track_id)
+        if not count:
+            abort(404, 'track id not found')
+        deleted = self.deleted_tracks()
+        deleted.add(track_id)
+        self.write_deleted_tracks(deleted)
+        return count, frames
+
+    def restore_track(self, track_id):
+        if not isinstance(track_id, str):
+            abort(400, 'invalid track id')
+        deleted = self.deleted_tracks()
+        if track_id not in deleted:
+            abort(404, 'track id is not deleted')
+        deleted.remove(track_id)
+        self.write_deleted_tracks(deleted)
 
     def crossings(self):
         return json.loads(self.crossings_file.read_text()) if self.crossings_file.exists() else []
@@ -454,6 +515,19 @@ class Clip:
         lines = payload.get('lines')
         if not isinstance(boxes, list) or not isinstance(lines, list):
             abort(400, 'boxes and lines must be arrays')
+        deleted_tracks = self.deleted_tracks()
+        # Keep globally hidden boxes archived in the per-frame review. This makes
+        # restoring a deleted track lossless even if this frame is saved while
+        # the track is hidden. A stale client also cannot replace that archive.
+        destination = self.edits / '{}.json'.format(frame)
+        if destination.exists():
+            archived_boxes = json.loads(destination.read_text()).get('boxes', [])
+        else:
+            archived_boxes = self._boxes(frame)
+        boxes = [box for box in boxes
+                 if str(box.get('track_id')) not in deleted_tracks]
+        boxes.extend(box for box in archived_boxes
+                     if str(box.get('track_id')) in deleted_tracks)
         if len(boxes) > 1000 or len(lines) > 500:
             abort(400, 'too many annotations')
         for box in boxes:
@@ -501,7 +575,6 @@ class Clip:
                                             stored_crossings.get(line['id']),
                                             'ped_crossing'):
                     self.save_crossing(frame, line)
-        destination = self.edits / '{}.json'.format(frame)
         temporary = destination.with_suffix('.json.tmp')
         temporary.write_text(json.dumps({'schema': 1, 'frame': frame,
                                          'auto_boundaries_reviewed': True,
@@ -579,7 +652,9 @@ def make_app(clip):
         return jsonify({'clip': clip.root.name, 'frames': clip.frame_ids,
                         'cameras': list(clip.cameras), 'classes': MODEL_CLASSES,
                         'map_classes': EDIT_MAP_CLASSES, 'output': str(clip.edits),
-                        'boundary_offset_m': clip.boundary_offset_m})
+                        'boundary_offset_m': clip.boundary_offset_m,
+                        'boundary_policy': clip.boundary_policy,
+                        'regenerate_auto_boundaries': clip.regenerate_auto_boundaries})
 
     @app.get('/api/frame/<int:frame>')
     def frame_data(frame):
@@ -630,6 +705,20 @@ def make_app(clip):
         clip.save_rule(value.get('kind'), str(value.get('key')), value.get('class'))
         return jsonify({'saved': True})
 
+    @app.delete('/api/track')
+    def delete_track():
+        value = request.get_json(force=True)
+        track_id = value.get('track_id')
+        count, frames = clip.delete_track(track_id)
+        return jsonify({'track_id': track_id, 'deleted_boxes': count,
+                        'affected_frames': frames})
+
+    @app.post('/api/track/restore')
+    def restore_track():
+        track_id = request.get_json(force=True).get('track_id')
+        clip.restore_track(track_id)
+        return jsonify({'track_id': track_id, 'restored': True})
+
     @app.post('/api/crossing/<int:frame>')
     def save_crossing(frame):
         identifier = clip.save_crossing(frame, request.get_json(force=True))
@@ -670,7 +759,14 @@ if __name__ == '__main__':
                         help='Optional parent folder for per-clip reviews; default: CLIP/reviews')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--boundary-offset-m', type=float, default=0.5,
-                        help='Outward offset from each outer road.bin divider (default: 0.5 m)')
+                        help='Outward boundary fallback offset (default: 0.5 m)')
+    parser.add_argument('--boundary-policy', choices=('semantic', 'outer-offset'),
+                        default='semantic',
+                        help='semantic: solid yellow plus outer-divider fallback; '
+                             'outer-offset: legacy extrema')
+    parser.add_argument('--regenerate-auto-boundaries', action='store_true',
+                        help='preview/regenerate auto lines in saved frames; manual lines are preserved')
     args = parser.parse_args()
-    clip = Clip(args.clip, args.edits_dir, args.boundary_offset_m)
+    clip = Clip(args.clip, args.edits_dir, args.boundary_offset_m,
+                args.boundary_policy, args.regenerate_auto_boundaries)
     make_app(clip).run(host='127.0.0.1', port=args.port, debug=False, threaded=True)

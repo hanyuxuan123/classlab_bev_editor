@@ -6,6 +6,13 @@ import struct
 import numpy as np
 
 
+# Solid yellow markings that bound the locally legal driving corridor.
+# Yellow dashed (10/12/14) remains divider because it is crossable. Mixed
+# solid/dashed yellow (*16) is deliberately excluded until its directed
+# solid-side relation to ego can be established reliably.
+SEMANTIC_BOUNDARY_TYPES = frozenset((110, 112, 114))
+
+
 def _varint(data, pos):
     value = shift = 0
     while True:
@@ -126,6 +133,164 @@ def offset_outer_dividers(lines, frame_number, distance=0.5):
                            'edge_side': side, 'offset_m': distance,
                            'source_road_id': source['id'], 'points': shifted})
     return result
+
+
+def _road_candidates(lines):
+    """Return long road.bin lines with a stable lateral position ahead."""
+    candidates = []
+    for line in lines:
+        if line.get('source') != 'road.bin' or line.get('class') != 'divider' \
+                or line.get('class_override', False) \
+                or len(line.get('points', [])) < 2:
+            continue
+        points = sorted(line['points'], key=lambda point: point[0])
+        if points[-1][0] - points[0][0] < 8:
+            continue
+        probes = []
+        for x in (0, 10, 20):
+            for a, b in zip(points, points[1:]):
+                if a[0] <= x <= b[0] and b[0] > a[0]:
+                    t = (x - a[0]) / (b[0] - a[0])
+                    probes.append(a[1] + t * (b[1] - a[1]))
+                    break
+        if len(probes) >= 2:
+            candidates.append((sum(probes) / len(probes), line, points))
+    return candidates
+
+
+def _offset_boundary(source, points, frame_number, side, distance,
+                     identifier_prefix='road-boundary',
+                     source_name='road.bin-offset', selection=None):
+    """Build a boundary parallel to a source line on its road-exterior side."""
+    shifted = []
+    for index, point in enumerate(points):
+        before = points[max(0, index - 1)]
+        after = points[min(len(points) - 1, index + 1)]
+        dx, dy = after[0] - before[0], after[1] - before[1]
+        length = math.hypot(dx, dy)
+        if length < 1e-6:
+            continue
+        sign = 1 if side == 'left' else -1
+        shifted.append([round(point[0] - sign * distance * dy / length, 3),
+                        round(point[1] + sign * distance * dx / length, 3),
+                        round(point[2] if len(point) > 2 else 0.0, 3)])
+    if len(shifted) < 2:
+        return None
+    result = {
+        'id': '{}:{}:{}'.format(identifier_prefix, frame_number, side),
+        'class': 'boundary',
+        'source': source_name,
+        'edge_side': side,
+        'offset_m': distance,
+        'line_id': source.get('line_id'),
+        'lane_id': source.get('lane_id'),
+        'lane_type': source.get('lane_type'),
+        'source_road_id': source['id'],
+        'points': shifted,
+    }
+    if selection is not None:
+        result['selection'] = selection
+    return result
+
+
+def semantic_boundaries(lines, frame_number, distance=0.5):
+    """Create semantic barriers plus an outer-road fallback on each side.
+
+    A selected yellow line is used at its measured position, rather than being
+    offset. When the outermost usable road line is a different divider, keep it
+    as a divider and add a parallel boundary ``distance`` metres farther toward
+    the road exterior. Thus an internal no-crossing line and the physical road
+    extent can both be represented. The mixed yellow *16 type remains a divider
+    because its legal crossing direction cannot be inferred here.
+    """
+    if not 0 <= distance <= 3:
+        raise ValueError('boundary offset must be between 0 and 3 m')
+    candidates = _road_candidates(lines)
+    semantic = [item for item in candidates
+                if item[1].get('lane_type') in SEMANTIC_BOUNDARY_TYPES]
+    selected = {}
+    for side, valid in (('left', lambda y: y > 0.1),
+                        ('right', lambda y: y < -0.1)):
+        choices = [item for item in semantic if valid(item[0])]
+        if choices:
+            selected[side] = min(choices, key=lambda item: abs(item[0]))
+
+    result = []
+    for side in ('left', 'right'):
+        if side in selected:
+            _, source, points = selected[side]
+            result.append({
+                'id': 'road-boundary-semantic:{}:{}'.format(frame_number, side),
+                'class': 'boundary',
+                'source': 'road.bin-semantic',
+                'edge_side': side,
+                'offset_m': 0.0,
+                'selection': 'nearest-solid-yellow',
+                'line_id': source.get('line_id'),
+                'lane_id': source.get('lane_id'),
+                'lane_type': source.get('lane_type'),
+                'source_road_id': source['id'],
+                'points': [list(point) for point in points],
+            })
+
+        valid = (lambda y: y > 0.1) if side == 'left' else (lambda y: y < -0.1)
+        side_candidates = [item for item in candidates if valid(item[0])]
+        if not side_candidates:
+            continue
+        outermost = (max(side_candidates, key=lambda item: item[0])
+                     if side == 'left'
+                     else min(side_candidates, key=lambda item: item[0]))
+        if side in selected and outermost[1]['id'] == selected[side][1]['id']:
+            continue
+        _, source, points = outermost
+        fallback = _offset_boundary(
+            source, points, frame_number, side, distance,
+            identifier_prefix='road-boundary-semantic-outer',
+            source_name='road.bin-semantic-outer',
+            selection='outermost-divider-offset')
+        if fallback is not None:
+            result.append(fallback)
+    return result
+
+
+def apply_boundary_policy(lines, frame_number, distance=0.5, policy='semantic'):
+    """Return lines with auto boundaries generated by the requested policy.
+
+    The legacy implementation remains available as ``outer-offset`` for exact
+    A/B comparison. Under ``semantic``, a source solid-yellow divider selected
+    as a boundary is removed so the same geometry is not trained as two map
+    classes. Manual and globally mapped lines are preserved.
+    """
+    if policy not in ('semantic', 'outer-offset'):
+        raise ValueError('unknown boundary policy: {}'.format(policy))
+    base = [line for line in lines
+            if line.get('source') not in ('road.bin-offset', 'road.bin-semantic',
+                                          'road.bin-semantic-outer')]
+    if policy == 'outer-offset':
+        generated = offset_outer_dividers(base, frame_number, distance)
+    else:
+        generated = semantic_boundaries(base, frame_number, distance)
+        protected_sides = set()
+        for line in base:
+            if line.get('class') != 'boundary':
+                continue
+            side = line.get('edge_side')
+            if side not in ('left', 'right'):
+                nearby = [point[1] for point in line.get('points', [])
+                          if len(point) >= 2 and -5 <= point[0] <= 20]
+                if nearby:
+                    lateral = sum(nearby) / len(nearby)
+                    side = 'left' if lateral > 0.1 else 'right' if lateral < -0.1 else None
+            if side:
+                protected_sides.add(side)
+        generated = [line for line in generated
+                     if line.get('edge_side') not in protected_sides]
+        selected_ids = {line.get('source_road_id') for line in generated
+                        if line.get('source') == 'road.bin-semantic'}
+        base = [line for line in base if line.get('id') not in selected_ids]
+    existing_ids = {line.get('id') for line in base}
+    base.extend(line for line in generated if line.get('id') not in existing_ids)
+    return base
 
 
 def rotation_xyz(angles):
