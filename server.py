@@ -528,6 +528,7 @@ class Clip:
                  if str(box.get('track_id')) not in deleted_tracks]
         boxes.extend(box for box in archived_boxes
                      if str(box.get('track_id')) in deleted_tracks)
+        unique_box_ids(boxes)
         if len(boxes) > 1000 or len(lines) > 500:
             abort(400, 'too many annotations')
         for box in boxes:
