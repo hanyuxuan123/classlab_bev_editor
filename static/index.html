@@ -6,8 +6,19 @@
   <button id="prev" title="Shift+左方向键">◀ 上一帧</button><input id="frame" type="number" min="0" step="1" title="输入帧号，按回车或点击跳转"><button id="go">跳转</button><button id="next" title="Shift+右方向键">下一帧 ▶</button><button id="fit">适配全部目标</button><button id="near">前方 80 m</button>
   <span id="stamp"></span><label>模式 <select id="mode"><option value="select">选择/拖动</option><option value="box">补画 3D 框</option><option value="divider">绘制车道线</option><option value="boundary">绘制道路边界</option><option value="ped_crossing">绘制人行横道</option><option value="point">给选中线加点</option></select></label>
   <button id="finish">完成绘制</button><button id="remove">删除所选</button><button id="undo" title="Ctrl+Z">撤销</button><button id="redo" title="Ctrl+Y">重做</button><button id="redraw" title="Ctrl+Shift+Z；Esc 取消">重画所选线</button><button id="apply-rule">所选类别应用到同 ID 全片段</button><button id="apply-map-line">所选静态线映射到相邻帧</button><button id="save" class="primary" title="Ctrl+S">保存本帧</button><button id="export">导出 2 Hz 标签</button>
+  <label title="取消勾选后，训练和评估跳过本帧该类别">GT 有效：<input id="valid-divider" type="checkbox" checked>divider <input id="valid-boundary" type="checkbox" checked>boundary <input id="valid-ped-crossing" type="checkbox" checked>ped_crossing</label>
+  <label>所选 boundary 侧 <select id="boundary-side"><option value="">自动判断</option><option value="left">left</option><option value="right">right</option></select></label>
 </div>
-<main><section class="bev-panel"><div class="panel-title">BEV：前方朝上，左侧在左；滚轮缩放、右键拖动画布</div><canvas id="bev"></canvas><div class="legend"><span style="color:#ff6b6b">红色三角：自车（尖端朝前）</span><span>灰点：运动补偿点云</span><span class="divider">车道线 divider</span><span class="boundary">外推道路边界 boundary</span><span class="crossing">人行横道 ped_crossing</span><span class="box">3D 框</span></div></section>
+<div class="maneuver-toolbar" style="display:flex;align-items:center;gap:12px;padding:7px 14px;background:#1b3240;border-bottom:1px solid #364656;flex-shrink:0;flex-wrap:wrap">
+  <strong>Stage2 五类轨迹标签</strong>
+  <label>标签 <select id="maneuver-label"><option value="TURN_RIGHT">TURN_RIGHT</option><option value="TURN_LEFT">TURN_LEFT</option><option value="KEEP_STRAIGHT">KEEP_STRAIGHT</option><option value="LANE_CHANGE_LEFT">LANE_CHANGE_LEFT</option><option value="LANE_CHANGE_RIGHT">LANE_CHANGE_RIGHT</option></select></label>
+  <label><input id="maneuver-valid" type="checkbox"> command_valid</label>
+  <span id="maneuver-summary">正在读取未来轨迹…</span>
+  <button id="save-maneuver" class="primary">保存本帧标签</button>
+  <button id="save-maneuver-window" title="按未来轨迹与 divider 的交点自动确定结束帧">应用换道窗口（前2.5s → 中心跨线）</button>
+  <button id="export-maneuvers">导出 2 Hz 五类标签</button>
+</div>
+<main><section class="bev-panel"><div class="panel-title">BEV：前方朝上，左侧在左；滚轮缩放、右键拖动画布</div><canvas id="bev"></canvas><div class="legend"><span style="color:#ff6b6b">红色三角：自车（尖端朝前）</span><span>灰点：运动补偿点云</span><span class="divider">检测车道线 divider</span><span class="boundary">lane_type / road_edge 确认的 boundary</span><span class="crossing">人行横道 ped_crossing</span><span class="box">3D 框</span></div></section>
 <section class="right-panel"><div class="panel-title">相机投影 <select id="camera"></select></div><div class="image-wrap"><canvas id="image"></canvas></div>
 <aside><h3>所选标注</h3><div id="inspector">点击 BEV 或相机图中的框、BEV 中的线。</div><p class="hint">相机图中的框与 BEV 中的框是同一个 3D 标注。手画的 divider、boundary、ped_crossing 可点“所选静态线映射到相邻帧”；Ctrl+S 保存本帧。双击或点“完成绘制”结束折线。</p></aside></section></main>
-<script src="/static/app.js"></script></body></html>
+<script src="/static/app.js?v=stage2-2"></script></body></html>

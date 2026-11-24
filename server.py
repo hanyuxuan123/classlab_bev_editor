@@ -19,8 +19,11 @@ from pathlib import Path
 import yaml
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 
-from geometry import (apply_boundary_policy, box_corners, frame_offsets,
-                      pcd_bev_points, project, read_road_frame, rotate_quaternion)
+from geometry import (BOUNDARY_SCHEMA_VERSION, apply_boundary_policy, box_corners,
+                      frame_offsets,
+                      pcd_bev_points, project, read_road_frame, road_edge_lines,
+                      rotate_quaternion)
+from maneuver_labels import MANEUVERS, ManeuverLabeler
 
 
 SOURCE_CLASS = {1: 'pedestrian', 2: 'bicycle', 3: 'car', 4: 'truck',
@@ -66,11 +69,16 @@ def unique_box_ids(boxes):
 
 class Clip:
     def __init__(self, root, edits_dir=None, boundary_offset_m=0.5,
-                 boundary_policy='semantic', regenerate_auto_boundaries=False):
+                 boundary_policy='semantic', regenerate_auto_boundaries=False,
+                 boundary_ambiguity_m=1.0, manual_boundary_buffer_m=1.0):
         if not math.isfinite(boundary_offset_m) or not 0 <= boundary_offset_m <= 3:
             raise ValueError('boundary offset must be between 0 and 3 m')
-        if boundary_policy not in ('semantic', 'outer-offset'):
+        if boundary_policy not in ('semantic', 'semantic-v2', 'outer-offset'):
             raise ValueError('unknown boundary policy: {}'.format(boundary_policy))
+        if not math.isfinite(boundary_ambiguity_m) or not 0 < boundary_ambiguity_m <= 10:
+            raise ValueError('boundary ambiguity threshold must be in (0, 10] m')
+        if not math.isfinite(manual_boundary_buffer_m) or not 0 <= manual_boundary_buffer_m <= 5:
+            raise ValueError('manual boundary buffer must be between 0 and 5 m')
         self.root = Path(root).resolve()
         self.result = self.root / 'result'
         self.edits = (Path(edits_dir).resolve() / self.root.name
@@ -79,6 +87,8 @@ class Clip:
         self.boundary_offset_m = boundary_offset_m
         self.boundary_policy = boundary_policy
         self.regenerate_auto_boundaries = regenerate_auto_boundaries
+        self.boundary_ambiguity_m = boundary_ambiguity_m
+        self.manual_boundary_buffer_m = manual_boundary_buffer_m
         self.rules_file = self.edits / 'class_rules.json'
         self.deleted_tracks_file = self.edits / 'deleted_tracks.json'
         self.crossings_file = self.edits / 'crossings_global.json'
@@ -107,6 +117,16 @@ class Clip:
         if len(self.road_offsets) != len(self.frame_ids):
             raise ValueError('road.bin has {} frames, GT.csv has {}'.format(
                 len(self.road_offsets), len(self.frame_ids)))
+        self.road_edges = {}
+        road_edge_path = self.result / 'debug' / 'roadEdge' / 'road_edge.csv'
+        if road_edge_path.is_file():
+            with road_edge_path.open(newline='') as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        frame = int(row['frameNum'])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    self.road_edges[frame] = road_edge_lines(row, frame)
         self.cameras = self._cameras()
         self.synced = {}
         sync_path = self.root / 'raw' / 'sync_time_list.txt'
@@ -128,6 +148,9 @@ class Clip:
             directory = self.root / 'raw' / 'image' / name
             stamps = sorted(int(p.stem) for p in directory.glob('*.jpeg'))
             self.images[name] = stamps
+        self.maneuvers = ManeuverLabeler(
+            self.frame_ids, self.timestamps, self.poses,
+            lambda frame: self.data(frame)['lines'], self.edits)
 
     def _cameras(self):
         config = yaml.safe_load((self.root / 'car__2024-12-12.yaml').read_text())
@@ -199,8 +222,12 @@ class Clip:
         unique_box_ids(boxes)
         lines = [line for line in lines if line.get('source') != 'road_edge.csv'
                  or line.get('class') != 'boundary_candidate']
+        saved_boundary_schema = content.get('boundary_status', {}).get('schema', 0)
+        needs_boundary_migration = (self.boundary_policy == 'semantic' and
+                                    saved_boundary_schema < BOUNDARY_SCHEMA_VERSION)
         generate_auto_boundaries = (self.regenerate_auto_boundaries
-                                    or not content.get('auto_boundaries_reviewed'))
+                                    or not content.get('auto_boundaries_reviewed')
+                                    or needs_boundary_migration)
         map_lines = self.map_lines()
         origin_ids = {item['origin_id'] for item in map_lines
                       if item.get('origin_frame') == frame and item.get('origin_id')}
@@ -254,19 +281,37 @@ class Clip:
             if (min(p[0] for p in points) <= 120 and max(p[0] for p in points) >= -30
                     and min(p[1] for p in points) <= 40 and max(p[1] for p in points) >= -40):
                 lines.append({'id': map_line['id'], 'class': map_line['class'],
-                              'source': 'global-map-line', 'points': points})
+                              'source': 'global-map-line', 'points': points,
+                              'edge_side': map_line.get('edge_side')})
         # Apply semantic selection after both class rules and global manual
         # map lines, so every explicit boundary takes priority over auto lines.
         if generate_auto_boundaries:
-            lines = apply_boundary_policy(lines, frame, self.boundary_offset_m,
-                                          self.boundary_policy)
+            lines.extend(self.road_edges.get(frame, []))
+            lines, boundary_status = apply_boundary_policy(
+                lines, frame, self.boundary_offset_m, self.boundary_policy,
+                self.boundary_ambiguity_m, self.manual_boundary_buffer_m,
+                return_status=True)
+        else:
+            boundary_status = content.get('boundary_status', {
+                'policy': self.boundary_policy, 'valid': True,
+                'ambiguous_sides': [], 'sides': {}})
+        map_valid = content.get('map_valid_classes', {})
+        map_valid = {name: bool(map_valid.get(name, default)) for name, default in
+                     (('divider', True), ('boundary', boundary_status.get('valid', True)),
+                      ('ped_crossing', True))}
+        # A stale saved True must not override a freshly detected closure
+        # failure. A reviewer can still repair the geometry and explicitly
+        # validate it when saving the reviewed frame.
+        if generate_auto_boundaries and not boundary_status.get('valid', True):
+            map_valid['boundary'] = False
         image_stamps = {name: self._image(frame, name) for name in self.cameras}
         return {'frame': frame, 'timestamp': self.timestamps[frame], 'boxes': boxes,
                 'lines': lines, 'images': image_stamps,
                 'reviewed': reviewed or rule_applied or track_deleted or any(
                     line.get('source') in ('global-crossing', 'global-map-line')
                     for line in lines),
-                'local_reviewed': reviewed}
+                'local_reviewed': reviewed, 'boundary_status': boundary_status,
+                'map_valid_classes': map_valid}
 
     def rules(self):
         if self.rules_file.exists():
@@ -370,6 +415,13 @@ class Clip:
                         'origin_id': str(item.get('id', identifier))}
             map_lines.append(existing)
         existing['class'] = item['class']
+        if item['class'] == 'boundary':
+            side = item.get('edge_side')
+            if side not in ('left', 'right'):
+                abort(400, 'boundary map line requires edge_side=left or right')
+            existing['edge_side'] = side
+        else:
+            existing.pop('edge_side', None)
         existing['points'] = [self.to_global(frame, point) for point in points]
         self.write_map_lines(map_lines)
         if existing['origin_frame'] == frame and existing['origin_id'] != identifier:
@@ -420,6 +472,7 @@ class Clip:
 
     def global_line_changed(self, frame, local, stored, category):
         if stored is None or stored.get('class', category) != local['class'] \
+                or stored.get('edge_side') != local.get('edge_side') \
                 or len(stored['points']) != len(local['points']):
             return True
         return any(any(abs(a - b) > 0.001 for a, b in zip(
@@ -513,8 +566,14 @@ class Clip:
             abort(404)
         boxes = payload.get('boxes')
         lines = payload.get('lines')
+        map_valid = payload.get('map_valid_classes')
+        boundary_status = payload.get('boundary_status', {})
         if not isinstance(boxes, list) or not isinstance(lines, list):
             abort(400, 'boxes and lines must be arrays')
+        if not isinstance(map_valid, dict) or set(map_valid) != {
+                'divider', 'boundary', 'ped_crossing'} or any(
+                    not isinstance(value, bool) for value in map_valid.values()):
+            abort(400, 'map_valid_classes must contain three booleans')
         deleted_tracks = self.deleted_tracks()
         # Keep globally hidden boxes archived in the per-frame review. This makes
         # restoring a deleted track lossless even if this frame is saved while
@@ -528,7 +587,6 @@ class Clip:
                  if str(box.get('track_id')) not in deleted_tracks]
         boxes.extend(box for box in archived_boxes
                      if str(box.get('track_id')) in deleted_tracks)
-        unique_box_ids(boxes)
         if len(boxes) > 1000 or len(lines) > 500:
             abort(400, 'too many annotations')
         for box in boxes:
@@ -549,6 +607,16 @@ class Clip:
             if any(not finite_numbers(point, 2) and not finite_numbers(point, 3)
                    for point in line['points']):
                 abort(400, 'invalid line point')
+            if line.get('class') == 'boundary' and line.get('edge_side') not in (
+                    'left', 'right'):
+                nearby = [point[1] for point in line['points']
+                          if -5 <= point[0] <= 20]
+                if not nearby:
+                    nearby = [point[1] for point in line['points']]
+                lateral = sum(nearby) / len(nearby)
+                if abs(lateral) <= 0.1:
+                    abort(400, 'boundary requires an unambiguous edge_side')
+                line['edge_side'] = 'left' if lateral > 0 else 'right'
         if len({box['id'] for box in boxes}) != len(boxes) \
                 or len({line['id'] for line in lines}) != len(lines):
             abort(400, 'duplicate annotation id')
@@ -577,8 +645,11 @@ class Clip:
                                             'ped_crossing'):
                     self.save_crossing(frame, line)
         temporary = destination.with_suffix('.json.tmp')
-        temporary.write_text(json.dumps({'schema': 1, 'frame': frame,
+        temporary.write_text(json.dumps({'schema': BOUNDARY_SCHEMA_VERSION,
+                                         'frame': frame,
                                          'auto_boundaries_reviewed': True,
+                                         'map_valid_classes': map_valid,
+                                         'boundary_status': boundary_status,
                                          'boxes': boxes,
                                          'lines': [line for line in lines
                                                    if line.get('source') not in
@@ -700,6 +771,37 @@ def make_app(clip):
                                      ensure_ascii=False))
         return jsonify({'path': str(output)})
 
+    @app.get('/api/maneuver/<int:frame>')
+    def maneuver(frame):
+        if frame not in clip.frames:
+            abort(404)
+        return jsonify(clip.maneuvers.suggest(frame))
+
+    @app.put('/api/maneuver/<int:frame>')
+    def save_maneuver(frame):
+        try:
+            return jsonify(clip.maneuvers.save(frame, request.get_json(force=True)))
+        except ValueError as error:
+            abort(400, str(error))
+
+    @app.post('/api/maneuver-window/<int:frame>')
+    def maneuver_window(frame):
+        value = request.get_json(force=True)
+        try:
+            result = clip.maneuvers.apply_lane_change_window(
+                frame, value.get('maneuver'), float(value.get('before_s', 2.5)))
+        except (ValueError, TypeError) as error:
+            abort(400, str(error))
+        return jsonify(dict(result, count=len(result['affected_frames'])))
+
+    @app.post('/api/maneuver-export')
+    def maneuver_export():
+        stride = int(request.get_json(silent=True).get('stride', 5)) if request.is_json else 5
+        if not 1 <= stride <= 20:
+            abort(400)
+        return jsonify({'path': str(clip.maneuvers.export(stride)),
+                        'pkl_modified': False})
+
     @app.put('/api/rule')
     def save_rule():
         value = request.get_json(force=True)
@@ -761,13 +863,19 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--boundary-offset-m', type=float, default=0.5,
                         help='Outward boundary fallback offset (default: 0.5 m)')
-    parser.add_argument('--boundary-policy', choices=('semantic', 'outer-offset'),
+    parser.add_argument('--boundary-policy',
+                        choices=('semantic', 'semantic-v2', 'outer-offset'),
                         default='semantic',
-                        help='semantic: solid yellow plus outer-divider fallback; '
-                             'outer-offset: legacy extrema')
+                        help='semantic: V3 corridor closure; semantic-v2: previous '
+                             'solid-yellow rule; outer-offset: legacy extrema')
     parser.add_argument('--regenerate-auto-boundaries', action='store_true',
                         help='preview/regenerate auto lines in saved frames; manual lines are preserved')
+    parser.add_argument('--boundary-ambiguity-m', type=float, default=1.0,
+                        help='Solid-yellow lines closer than this form one cluster')
+    parser.add_argument('--manual-boundary-buffer-m', type=float, default=1.0,
+                        help='Remove only auto-boundary portions covered by a manual line')
     args = parser.parse_args()
     clip = Clip(args.clip, args.edits_dir, args.boundary_offset_m,
-                args.boundary_policy, args.regenerate_auto_boundaries)
+                args.boundary_policy, args.regenerate_auto_boundaries,
+                args.boundary_ambiguity_m, args.manual_boundary_buffer_m)
     make_app(clip).run(host='127.0.0.1', port=args.port, debug=False, threaded=True)

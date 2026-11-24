@@ -11,6 +11,7 @@ import numpy as np
 # solid/dashed yellow (*16) is deliberately excluded until its directed
 # solid-side relation to ego can be established reliably.
 SEMANTIC_BOUNDARY_TYPES = frozenset((110, 112, 114))
+BOUNDARY_SCHEMA_VERSION = 9
 
 
 def _varint(data, pos):
@@ -193,27 +194,80 @@ def _offset_boundary(source, points, frame_number, side, distance,
     return result
 
 
-def semantic_boundaries(lines, frame_number, distance=0.5):
-    """Create semantic barriers plus an outer-road fallback on each side.
+def road_edge_lines(row, frame_number):
+    """Convert one road_edge.csv row into left/right polynomial candidates."""
+    result = []
+    for side, prefix in (('left', 'left_edge'), ('right', 'righ_edge')):
+        if str(row.get(prefix + '.isValid', '')).lower() != 'true':
+            continue
+        try:
+            start = max(-10.0, float(row[prefix + '.rangeN']))
+            stop = min(120.0, float(row[prefix + '.rangeP']))
+            coefficients = [float(row[prefix + name]) for name in (
+                '.zeroOrderCoeff', '.firstOrderCoeff', '.secondOrderCoeff')]
+            near = float(row[prefix + '.thirdOrderCoeffNear'])
+            far = float(row[prefix + '.thirdOrderCoeffFar'])
+            dividing = float(row[prefix + '.dividingPoint'])
+            use_far = str(row.get(prefix + '.fitFarFlag', '')).lower() == 'true'
+        except (KeyError, TypeError, ValueError):
+            continue
+        if stop - start < 8:
+            continue
+        switch_jump = (abs((far - near) * dividing**3)
+                       if use_far and start < dividing < stop else 0.0)
+        points = []
+        x = math.ceil(start)
+        while x <= math.floor(stop):
+            third = far if use_far and x > dividing else near
+            y = coefficients[0] + coefficients[1] * x + coefficients[2] * x*x + third * x*x*x
+            if math.isfinite(y) and abs(y) <= 100:
+                points.append([float(x), round(y, 3), 0.0])
+            x += 1
+        if len(points) >= 9:
+            result.append({
+                'id': 'road-edge-candidate:{}:{}'.format(frame_number, side),
+                'class': 'boundary_candidate', 'source': 'road_edge.csv',
+                'edge_side': side, 'points': points,
+                'fit_switch_jump_m': round(switch_jump, 3),
+            })
+    return result
 
-    A selected yellow line is used at its measured position, rather than being
-    offset. When the outermost usable road line is a different divider, keep it
-    as a divider and add a parallel boundary ``distance`` metres farther toward
-    the road exterior. Thus an internal no-crossing line and the physical road
-    extent can both be represented. The mixed yellow *16 type remains a divider
-    because its legal crossing direction cannot be inferred here.
-    """
+
+def semantic_boundaries_v2(lines, frame_number, distance=0.5, ambiguity_m=1.0,
+                           return_status=False):
+    """Create auto boundaries only where solid-yellow evidence is unambiguous."""
     if not 0 <= distance <= 3:
         raise ValueError('boundary offset must be between 0 and 3 m')
+    if not 0 < ambiguity_m <= 10:
+        raise ValueError('boundary ambiguity threshold must be in (0, 10] m')
     candidates = _road_candidates(lines)
     semantic = [item for item in candidates
                 if item[1].get('lane_type') in SEMANTIC_BOUNDARY_TYPES]
     selected = {}
+    status = {'policy': 'semantic-v2', 'ambiguity_m': ambiguity_m,
+              'ambiguous_sides': [], 'absent_sides': [], 'sides': {}}
     for side, valid in (('left', lambda y: y > 0.1),
                         ('right', lambda y: y < -0.1)):
         choices = [item for item in semantic if valid(item[0])]
-        if choices:
-            selected[side] = min(choices, key=lambda item: abs(item[0]))
+        lateral = sorted(abs(item[0]) for item in choices)
+        side_status = {'candidate_count': len(choices)}
+        if not choices:
+            side_status['state'] = 'absent'
+            status['absent_sides'].append(side)
+        elif len(choices) == 1:
+            side_status['state'] = 'single'
+            side_status['spread_m'] = 0.0
+            selected[side] = choices[0]
+        else:
+            spread = lateral[-1] - lateral[0]
+            side_status['spread_m'] = round(spread, 3)
+            if spread >= ambiguity_m:
+                side_status['state'] = 'ambiguous'
+                status['ambiguous_sides'].append(side)
+            else:
+                side_status['state'] = 'clustered'
+                selected[side] = max(choices, key=lambda item: abs(item[0]))
+        status['sides'][side] = side_status
 
     result = []
     for side in ('left', 'right'):
@@ -225,72 +279,288 @@ def semantic_boundaries(lines, frame_number, distance=0.5):
                 'source': 'road.bin-semantic',
                 'edge_side': side,
                 'offset_m': 0.0,
-                'selection': 'nearest-solid-yellow',
+                'selection': ('single-solid-yellow' if
+                              status['sides'][side]['state'] == 'single' else
+                              'clustered-outermost-solid-yellow'),
                 'line_id': source.get('line_id'),
                 'lane_id': source.get('lane_id'),
                 'lane_type': source.get('lane_type'),
                 'source_road_id': source['id'],
                 'points': [list(point) for point in points],
             })
+    status['valid'] = not status['ambiguous_sides']
+    return (result, status) if return_status else result
 
-        valid = (lambda y: y > 0.1) if side == 'left' else (lambda y: y < -0.1)
-        side_candidates = [item for item in candidates if valid(item[0])]
-        if not side_candidates:
+
+def _lateral_at(points, x):
+    points = sorted(points, key=lambda point: point[0])
+    for first, second in zip(points, points[1:]):
+        if first[0] <= x <= second[0] and second[0] > first[0]:
+            ratio = (x - first[0]) / (second[0] - first[0])
+            return first[1] + ratio * (second[1] - first[1])
+    return None
+
+
+def _stable_on_side(points, side):
+    """Reject a line that crosses the ego axis anywhere in its forward span.
+
+    ``road.bin`` occasionally contains long, internally smooth polylines that
+    drift from one side of the road to the other.  A near-field-only probe
+    incorrectly treated those lines as stable hard-yellow/outer-edge evidence.
+    """
+    forward = [point[1] for point in points
+               if len(point) >= 2 and point[0] >= 0 and math.isfinite(point[1])]
+    if len(forward) < 2:
+        return False
+    if side == 'left':
+        return min(forward) > 0.1
+    return max(forward) < -0.1
+
+
+def _stable_near_side(points, side, max_x=20.0):
+    """Check semantic lane side locally without rejecting a curved road.
+
+    In vehicle coordinates a correct boundary on a right-hand bend can cross
+    y=0 farther ahead.  Lane-type evidence is explicit, so only the near-field
+    relation to the ego corridor should decide left versus right.
+    """
+    lateral = [point[1] for point in points
+               if len(point) >= 2 and 0 <= point[0] <= max_x
+               and math.isfinite(point[1])]
+    if len(lateral) < 2:
+        return False
+    if side == 'left':
+        return min(lateral) > 0.1
+    return max(lateral) < -0.1
+
+
+def _validate_road_edge(line, side, road_candidates):
+    points = line.get('points', [])
+    if len(points) < 2 or points[-1][0] - points[0][0] < 15:
+        return False, 'short'
+    if line.get('fit_switch_jump_m', 0.0) > 0.75:
+        return False, 'discontinuous-fit-switch'
+    if not _stable_on_side(points, side):
+        return False, 'crosses-ego-axis'
+    at_zero = _lateral_at(points, 0)
+    if at_zero is None or (side == 'left' and at_zero <= 1.0) \
+            or (side == 'right' and at_zero >= -1.0):
+        return False, 'wrong-side-near-ego'
+    comparisons = []
+    edge_values = []
+    max_x = min(80, int(math.floor(points[-1][0] / 5.0)) * 5)
+    for x in range(0, max_x + 1, 5):
+        edge = _lateral_at(points, x)
+        roads = [_lateral_at(candidate[2], x) for candidate in road_candidates]
+        roads = [value for value in roads if value is not None]
+        if edge is None or not roads:
             continue
-        outermost = (max(side_candidates, key=lambda item: item[0])
-                     if side == 'left'
-                     else min(side_candidates, key=lambda item: item[0]))
-        if side in selected and outermost[1]['id'] == selected[side][1]['id']:
-            continue
-        _, source, points = outermost
-        fallback = _offset_boundary(
-            source, points, frame_number, side, distance,
-            identifier_prefix='road-boundary-semantic-outer',
-            source_name='road.bin-semantic-outer',
-            selection='outermost-divider-offset')
-        if fallback is not None:
-            result.append(fallback)
+        outer = max(roads) if side == 'left' else min(roads)
+        gap = edge - outer if side == 'left' else outer - edge
+        comparisons.append(0.2 <= gap <= 8.0)
+        edge_values.append(edge)
+    if len(comparisons) < 3:
+        return False, 'insufficient-overlap'
+    if sum(comparisons) / len(comparisons) < 0.8:
+        return False, 'not-outside-road-lines'
+    if any(abs(second - first) > 4.0 for first, second in zip(
+            edge_values, edge_values[1:])):
+        return False, 'unstable-curve'
+    return True, 'validated'
+
+
+def semantic_boundaries(lines, frame_number, distance=0.5, ambiguity_m=1.0,
+                        return_status=False):
+    """Semantic V3: preserve dividers and close both sides of the ego corridor."""
+    if not 0 <= distance <= 3:
+        raise ValueError('boundary offset must be between 0 and 3 m')
+    if not 0 < ambiguity_m <= 10:
+        raise ValueError('solid-yellow cluster threshold must be in (0, 10] m')
+    candidates = _road_candidates(lines)
+    solid = [item for item in candidates
+             if item[1].get('lane_type') in SEMANTIC_BOUNDARY_TYPES]
+    edge_candidates = [line for line in lines
+                       if line.get('source') == 'road_edge.csv']
+    result = []
+    status = {'policy': 'semantic', 'schema': BOUNDARY_SCHEMA_VERSION,
+              'solid_yellow_cluster_m': ambiguity_m,
+              'sides': {}, 'unresolved_sides': [], 'ambiguous_sides': []}
+    for side, valid in (('left', lambda y: y > 0.1),
+                        ('right', lambda y: y < -0.1)):
+        choices = sorted((item for item in solid if valid(item[0])),
+                         key=lambda item: abs(item[0]))
+        stable_choices = [item for item in choices
+                          if _stable_near_side(item[2], side)]
+        side_status = {
+            'solid_yellow_candidates': len(choices),
+            'stable_solid_yellow_candidates': len(stable_choices),
+        }
+        generated = None
+        if stable_choices:
+            first_distance = abs(stable_choices[0][0])
+            cluster = [item for item in stable_choices
+                       if abs(abs(item[0]) - first_distance) < ambiguity_m]
+            _, source, points = min(cluster, key=lambda item: abs(item[0]))
+            generated = {
+                'id': 'road-boundary-semantic:{}:{}'.format(frame_number, side),
+                'class': 'boundary', 'source': 'road.bin-semantic',
+                'edge_side': side, 'offset_m': 0.0,
+                'selection': 'first-solid-yellow-cluster-near-edge',
+                'cluster_size': len(cluster),
+                'line_id': source.get('line_id'), 'lane_id': source.get('lane_id'),
+                'lane_type': source.get('lane_type'),
+                'source_road_id': source['id'],
+                'points': [list(point) for point in points],
+            }
+            side_status.update(state='hard-divider', source='solid-yellow-cluster',
+                               cluster_size=len(cluster), valid=True)
+        else:
+            edge = next((line for line in edge_candidates
+                         if line.get('edge_side') == side), None)
+            accepted, reason = ((False, 'missing') if edge is None else
+                                _validate_road_edge(edge, side, candidates))
+            side_status['road_edge_check'] = reason
+            if accepted:
+                generated = dict(edge)
+                generated.update(
+                    id='road-boundary-edge:{}:{}'.format(frame_number, side),
+                    **{'class': 'boundary', 'source': 'road_edge.csv-validated',
+                       'selection': 'validated-road-edge'})
+                side_status.update(state='road-edge', source='validated-road-edge',
+                                   valid=True)
+            else:
+                # Do not manufacture a drivable-area boundary by offsetting an
+                # arbitrary outer road.bin divider.  At junctions that line can
+                # belong to another branch.  Lane-type semantic boundaries and
+                # independently validated road-edge boundaries remain valid.
+                side_status.update(state='unresolved', source=None, valid=False)
+                status['unresolved_sides'].append(side)
+        if generated is not None:
+            result.append(generated)
+        status['sides'][side] = side_status
+    # ``valid`` means every emitted boundary is backed by an accepted source
+    # and may enter training. ``complete`` separately records whether both
+    # corridor sides were recovered; a missing side must not discard a valid
+    # lane-type/road-edge boundary on the other side.
+    status['complete'] = not status['unresolved_sides'] \
+        and not status['ambiguous_sides']
+    status['valid'] = bool(result) and not status['ambiguous_sides']
+    return (result, status) if return_status else result
+
+
+def _boundary_side(line):
+    side = line.get('edge_side')
+    if side in ('left', 'right'):
+        return side
+    lateral = [point[1] for point in line.get('points', [])
+               if len(point) >= 2 and -5 <= point[0] <= 20]
+    if not lateral:
+        lateral = [point[1] for point in line.get('points', []) if len(point) >= 2]
+    mean = sum(lateral) / len(lateral) if lateral else 0.0
+    return 'left' if mean > 0.1 else 'right' if mean < -0.1 else None
+
+
+def _point_segment_distance(point, first, second):
+    dx, dy = second[0] - first[0], second[1] - first[1]
+    length2 = dx * dx + dy * dy
+    if length2 <= 1e-12:
+        return math.hypot(point[0] - first[0], point[1] - first[1])
+    t = max(0.0, min(1.0, ((point[0] - first[0]) * dx +
+                           (point[1] - first[1]) * dy) / length2))
+    return math.hypot(point[0] - first[0] - t * dx,
+                      point[1] - first[1] - t * dy)
+
+
+def _subtract_manual_coverage(line, manual_lines, buffer_m):
+    """Split an auto line into runs outside the manual-line spatial buffer."""
+    if not manual_lines:
+        return [line]
+    segments = [(a, b) for manual in manual_lines
+                for a, b in zip(manual.get('points', []),
+                                manual.get('points', [])[1:])]
+    keep = [all(_point_segment_distance(point, a, b) > buffer_m
+                for a, b in segments) for point in line['points']]
+    runs, current = [], []
+    for point, valid in zip(line['points'], keep):
+        if valid:
+            current.append(point)
+        elif len(current) >= 2:
+            runs.append(current)
+            current = []
+        else:
+            current = []
+    if len(current) >= 2:
+        runs.append(current)
+    result = []
+    for index, points in enumerate(runs):
+        item = dict(line)
+        item['id'] = '{}:segment{}'.format(line['id'], index)
+        item['points'] = points
+        result.append(item)
     return result
 
 
-def apply_boundary_policy(lines, frame_number, distance=0.5, policy='semantic'):
+def apply_boundary_policy(lines, frame_number, distance=0.5, policy='semantic',
+                          ambiguity_m=1.0, manual_buffer_m=1.0,
+                          return_status=False):
     """Return lines with auto boundaries generated by the requested policy.
 
-    The legacy implementation remains available as ``outer-offset`` for exact
-    A/B comparison. Under ``semantic``, a source solid-yellow divider selected
-    as a boundary is removed so the same geometry is not trained as two map
-    classes. Manual and globally mapped lines are preserved.
+    ``semantic`` keeps a solid-yellow line as ``divider`` when
+    duplicating its geometry as ``boundary``. ``semantic-v2`` preserves the old
+    mutually-exclusive behavior for rollback/A-B comparison.
     """
-    if policy not in ('semantic', 'outer-offset'):
+    if policy not in ('semantic', 'semantic-v2', 'outer-offset'):
         raise ValueError('unknown boundary policy: {}'.format(policy))
-    base = [line for line in lines
-            if line.get('source') not in ('road.bin-offset', 'road.bin-semantic',
-                                          'road.bin-semantic-outer')]
+    if not 0 <= manual_buffer_m <= 5:
+        raise ValueError('manual boundary buffer must be between 0 and 5 m')
+    auto_sources = ('road.bin-offset', 'road.bin-semantic',
+                    'road.bin-semantic-outer', 'road_edge.csv-validated')
+    base = [line for line in lines if line.get('source') not in auto_sources]
     if policy == 'outer-offset':
         generated = offset_outer_dividers(base, frame_number, distance)
+        status = {'policy': policy, 'valid': True, 'ambiguous_sides': [],
+                  'absent_sides': [], 'sides': {}}
     else:
-        generated = semantic_boundaries(base, frame_number, distance)
-        protected_sides = set()
+        boundary_fn = semantic_boundaries_v2 if policy == 'semantic-v2' else semantic_boundaries
+        generated, status = boundary_fn(
+            base, frame_number, distance, ambiguity_m, return_status=True)
+        manual_by_side = {'left': [], 'right': []}
         for line in base:
-            if line.get('class') != 'boundary':
-                continue
-            side = line.get('edge_side')
-            if side not in ('left', 'right'):
-                nearby = [point[1] for point in line.get('points', [])
-                          if len(point) >= 2 and -5 <= point[0] <= 20]
-                if nearby:
-                    lateral = sum(nearby) / len(nearby)
-                    side = 'left' if lateral > 0.1 else 'right' if lateral < -0.1 else None
-            if side:
-                protected_sides.add(side)
-        generated = [line for line in generated
-                     if line.get('edge_side') not in protected_sides]
-        selected_ids = {line.get('source_road_id') for line in generated
-                        if line.get('source') == 'road.bin-semantic'}
-        base = [line for line in base if line.get('id') not in selected_ids]
+            if line.get('class') == 'boundary':
+                side = _boundary_side(line)
+                if side:
+                    line['edge_side'] = side
+                    manual_by_side[side].append(line)
+        status['manual_sides'] = [side for side, values in manual_by_side.items()
+                                  if values]
+        for side in status.get('sides', {}):
+            if manual_by_side[side]:
+                status['sides'][side].update(
+                    state='manual', source='manual/global', valid=True)
+                if side in status.get('unresolved_sides', []):
+                    status['unresolved_sides'].remove(side)
+                if side in status.get('ambiguous_sides', []):
+                    status['ambiguous_sides'].remove(side)
+        if policy == 'semantic':
+            status['complete'] = not status.get('unresolved_sides', []) \
+                and not status.get('ambiguous_sides', [])
+            status['valid'] = bool(generated) or any(manual_by_side.values())
+            status['valid'] = status['valid'] \
+                and not status.get('ambiguous_sides', [])
+        else:
+            status['valid'] = not status.get('unresolved_sides', []) \
+                and not status.get('ambiguous_sides', [])
+        if policy == 'semantic-v2':
+            selected_ids = {line.get('source_road_id') for line in generated
+                            if line.get('source') == 'road.bin-semantic'}
+            base = [line for line in base if line.get('id') not in selected_ids]
+        generated = [segment for line in generated
+                     for segment in _subtract_manual_coverage(
+                         line, manual_by_side[line['edge_side']], manual_buffer_m)]
     existing_ids = {line.get('id') for line in base}
     base.extend(line for line in generated if line.get('id') not in existing_ids)
-    return base
+    base = [line for line in base if line.get('source') != 'road_edge.csv']
+    return (base, status) if return_status else base
 
 
 def rotation_xyz(angles):
